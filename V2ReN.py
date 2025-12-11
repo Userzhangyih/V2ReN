@@ -7,40 +7,22 @@ import subprocess
 # 导入配置模块
 from config.logger import init_logger, log_info, log_warning, log_error, log_debug
 from config.GUI import create_gui
-from config.Protocols import parse_node, test_node, rewrite_node_with_new_name
+from config.protocols import parse_node, test_node, rewrite_node_with_new_name
 from config.Base64 import process_base64_content
 
 def load_country_mappings():
-
-
-    # """加载国家映射配置"""
-    # try:
-    #     with open("config/country_mappings.json", "r", encoding="utf-8") as f:
-    #         return json.load(f)
-    # except FileNotFoundError:
-    #     log_error("找不到 country_mappings.json 文件")
-    #     return None
-    # except json.JSONDecodeError:
-    #     log_error("country_mappings.json 文件格式错误")
-    #     return None
-    
         data = {
                     "country_zh_map": "data/country_zh_map.json",
                     "city_zh_map": "data/city_zh_map.json",
                     "country_flags": "data/country_flags.json"
                 }
     
-
         with open(data["country_zh_map"], "r", encoding="utf-8") as f:
             country_mappings = json.load(f)
         
-
         with open(data["country_flags"], "r", encoding="utf-8") as f:
             flag_mappings = json.load(f)
-        
-        # 加载城市名称映射
 
-        
         with open(data['city_zh_map'], "r", encoding="utf-8") as f:
             city_mappings = json.load(f)
         
