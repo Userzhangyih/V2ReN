@@ -1,4 +1,6 @@
-# Config/Local.py
+# Config/Local_API.py
+"""本地数据库查询API - 专门处理GeoLite2本地数据库查询"""
+
 import geoip2.database
 import os
 import re
@@ -18,12 +20,10 @@ class LocalGeoIPQuery:
         if db_paths is None:
             # 默认数据库路径，支持多种可能的位置
             default_paths = [
-                # 尝试不同位置的数据库文件
                 os.path.join("Data", "Database", "GeoLite2-City.mmdb"),
                 os.path.join("Data", "GeoLite2-City.mmdb"),
                 os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Data", "Database", "GeoLite2-City.mmdb"),
                 os.path.join("GeoLite2-City.mmdb"),
-                # 尝试绝对路径
                 r"D:\Program\V2ReN\Data\Database\GeoLite2-City.mmdb",
             ]
             db_paths = default_paths
@@ -46,16 +46,14 @@ class LocalGeoIPQuery:
         """尝试加载数据库文件"""
         for db_path in self.db_paths:
             try:
-                # 处理路径中的转义字符
                 db_path = os.path.normpath(db_path)
                 if os.path.exists(db_path):
                     self.reader = geoip2.database.Reader(db_path)
                     self.db_loaded = True
                     self.used_db_path = db_path
                     file_size = os.path.getsize(db_path)
-                    log_info(f"本地GeoLite2数据库加载成功: {db_path} ({file_size/1024/1024:.2f} MB)")
+                    # log_info(f"本地GeoLite2数据库加载成功: {db_path} ({file_size/1024/1024:.2f} MB)")
                     
-                    # 输出数据库信息
                     self._log_database_info()
                     return
                 else:
@@ -65,17 +63,17 @@ class LocalGeoIPQuery:
                 continue
         
         if not self.db_loaded:
-            log_warning("未找到可用的本地GeoLite2数据库，将使用在线API查询")
+            log_warning("未找到可用的本地GeoLite2数据库")
     
     def _log_database_info(self):
         """记录数据库信息"""
         try:
             metadata = self.reader.metadata()
-            log_info(f"数据库版本: {metadata.database_type} v{metadata.binary_format_major_version}.{metadata.binary_format_minor_version}")
-            log_info(f"构建时间: {metadata.build_epoch} ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(metadata.build_epoch))})")
-            log_info(f"描述: {metadata.description.get('en', 'Unknown')}")
-            log_info(f"IP版本: IPv{metadata.ip_version}")
-            log_info(f"节点数: {metadata.node_count}")
+            # log_info(f"数据库版本: {metadata.database_type} v{metadata.binary_format_major_version}.{metadata.binary_format_minor_version}")
+            # log_info(f"构建时间: {metadata.build_epoch} ({time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(metadata.build_epoch))})")
+            # log_info(f"描述: {metadata.description.get('en', 'Unknown')}")
+            # log_info(f"IP版本: IPv{metadata.ip_version}")
+            # log_info(f"节点数: {metadata.node_count}")
         except Exception as e:
             log_debug(f"无法获取数据库信息: {e}")
     
@@ -88,8 +86,7 @@ class LocalGeoIPQuery:
             check_city_only: 如果为True，只检查是否有城市名，不返回完整结果
             
         Returns:
-            dict: 地理位置信息字典，包含标准化的字段
-                  如果check_city_only为True，返回{'has_city': True/False}
+            dict: 地理位置信息字典
         """
         self.stats['total_queries'] += 1
         
@@ -100,7 +97,6 @@ class LocalGeoIPQuery:
             return None
         
         try:
-            # 验证IP地址格式
             if not self._is_valid_ip(ip):
                 log_debug(f"无效的IP地址格式: {ip}")
                 self.stats['errors'] += 1
@@ -108,14 +104,11 @@ class LocalGeoIPQuery:
                     return {'has_city': False, 'invalid_ip': True}
                 return None
             
-            # 查询城市信息
             response = self.reader.city(ip)
             
-            # 检查是否有城市信息
             has_city = bool(response.city.name and response.city.name.strip())
             city_name = response.city.name if response.city.name else ''
             
-            # 如果只需要检查城市信息，返回简化结果
             if check_city_only:
                 self.stats['success_queries'] += 1
                 if has_city:
@@ -129,22 +122,21 @@ class LocalGeoIPQuery:
                     'country': response.country.name if response.country.name else ''
                 }
             
-            # 构建完整结果字典
             result = {
                 'ip': ip,
                 'country': response.country.name if response.country.name else '',
                 'country_code': response.country.iso_code if response.country.iso_code else '',
                 'city': city_name,
-                'city_en': city_name,  # 英文城市名
+                'city_en': city_name,
                 'region': response.subdivisions.most_specific.name if response.subdivisions.most_specific.name else '',
                 'region_code': response.subdivisions.most_specific.iso_code if response.subdivisions.most_specific.iso_code else '',
                 'lat': float(response.location.latitude) if response.location.latitude else 0.0,
                 'lon': float(response.location.longitude) if response.location.longitude else 0.0,
                 'timezone': response.location.time_zone if response.location.time_zone else '',
-                'isp': '',  # 本地数据库不包含ISP信息
+                'isp': '',
                 'source': 'local-geolite2',
                 'local_query': True,
-                'has_city': has_city,  # 是否有城市信息
+                'has_city': has_city,
                 'accuracy': 'high' if has_city else 'low',
                 'postal_code': response.postal.code if response.postal.code else '',
                 'metro_code': response.location.metro_code if response.location.metro_code else '',
@@ -153,7 +145,6 @@ class LocalGeoIPQuery:
                 'is_in_european_union': response.country.is_in_european_union if hasattr(response.country, 'is_in_european_union') else False
             }
             
-            # 更新统计信息
             self.stats['success_queries'] += 1
             if has_city:
                 self.stats['city_found_queries'] += 1
@@ -197,7 +188,7 @@ class LocalGeoIPQuery:
             ip_list: IP地址列表
             
         Returns:
-            dict: 统计结果，包括总数、有城市信息的数量、覆盖率等
+            dict: 统计结果
         """
         total = len(ip_list)
         has_city = 0
@@ -232,17 +223,13 @@ class LocalGeoIPQuery:
     
     def _is_valid_ip(self, ip):
         """验证IP地址格式"""
-        # 移除可能的空格
         ip = ip.strip()
         
-        # IPv4模式
         ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
-        # IPv6简化模式
         ipv6_pattern = r'^([0-9a-fA-F]{1,4}:){1,7}[0-9a-fA-F]{1,4}$'
         ipv6_compressed_pattern = r'^([0-9a-fA-F]{1,4}(:[0-9a-fA-F]{1,4})*)?::([0-9a-fA-F]{1,4}(:[0-9a-fA-F]{1,4})*)?$'
         
         if re.match(ipv4_pattern, ip):
-            # 验证IPv4各部分在0-255之间
             parts = ip.split('.')
             if len(parts) != 4:
                 return False

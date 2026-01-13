@@ -7,7 +7,9 @@ import time
 import ipaddress
 import concurrent.futures
 from Config.Logger import log_debug, log_error, log_info, log_warning
-from Config.IP_Test import get_ip_location, get_ip_location_with_fallback, get_ip_location_force_online, get_query_stats, clear_geo_cache, check_local_city_coverage
+
+# 只从IP_Test.py导入需要的功能，不再直接导入Local或IP_API
+from Config.IP_Test import get_ip_location, get_ip_location_with_fallback, get_ip_location_force_online, get_query_stats, clear_geo_cache, check_local_city_coverage, check_ip_has_city_local
 
 
 def is_private_or_special_ip(ip):
@@ -110,13 +112,234 @@ def create_unknown_location_result(ip, name, server, port, node_info):
     }
 
 
+def _get_node_ip_address(server):
+    """
+    获取节点IP地址并进行验证
+    
+    Args:
+        server: 服务器地址（可以是域名或IP）
+        
+    Returns:
+        tuple: (ip_address, validation_result)
+               validation_result: "valid" | "private_ip" | "resolve_failed"
+    """
+    try:
+        # 检查是否为IP地址
+        try:
+            ip_obj = ipaddress.ip_address(server)
+            # 如果是IP地址，直接检查是否为私有/特殊IP
+            if is_private_or_special_ip(server):
+                return server, "private_ip"
+            return server, "valid"
+        except ValueError:
+            # 不是有效的IP地址，假设是域名，需要解析
+            log_info(f"解析域名: {server}")
+            ip = get_ip_address(server)
+            
+            if not ip:
+                return None, "resolve_failed"
+            
+            # 解析后再次检查是否为私有/特殊IP
+            if is_private_or_special_ip(ip):
+                log_warning(f"域名解析为私有/特殊IP地址: {server} -> {ip}")
+                return ip, "private_ip"
+            
+            return ip, "valid"
+    except Exception as e:
+        log_error(f"获取IP地址失败 {server}: {e}")
+        return None, "resolve_failed"
+
+
+def _query_location_online(ip):
+    """
+    在线查询地理位置
+    
+    Args:
+        ip: IP地址
+        
+    Returns:
+        dict: 在线查询结果，如果失败返回None
+    """
+    online_location = get_ip_location_force_online(ip)
+    
+    if online_location:
+        service_detail = online_location.get('source', 'unknown_api')
+        if online_location.get('has_city'):
+            city_name = online_location.get('city', 'Unknown')
+            country_code = online_location.get('country_code', 'Unknown')
+            # log_info(f"[{ip}] 在线查询成功[{service_detail}]: {city_name}, {country_code}")
+        else:
+            country_code = online_location.get('country_code', 'Unknown')
+            log_warning(f"[{ip}] 在线查询完成但无城市信息[{service_detail}]: {country_code}")
+        return online_location
+    else:
+        log_error(f"[{ip}] 在线查询失败: 所有在线服务均无法获取位置信息")
+        return None
+
+
+def _query_location_with_fallback(ip):
+    """
+    智能地理位置查询策略：本地优先，在线降级
+    
+    Args:
+        ip: IP地址
+        
+    Returns:
+        dict: 地理位置查询结果
+    """
+    # 1. 检查本地数据库是否有城市信息
+    local_has_city = check_ip_has_city_local(ip)
+    # log_info(f"城市信息可用性: {local_has_city}")
+    
+    # 2. 根据情况选择查询策略
+    if local_has_city:
+        # 本地有城市信息，使用本地查询（不启用降级）
+        location = get_ip_location(ip, enable_fallback=False)
+        if location and location.get('has_city'):
+            log_info(f"[{ip}] 本地查询成功（有城市信息）[GeoLite2-City.mmdb]: "
+                    f"{location.get('city', 'Unknown')}, {location.get('country_code', 'Unknown')}")
+            return location
+        elif location:
+            # 本地查询成功但没有城市信息
+            log_info(f"[{ip}] 本地查询（无城市信息）: {location.get('country_code', 'Unknown')}")
+            return location
+        else:
+            # 本地查询失败
+            log_info(f"[{ip}] 本地查询失败，切换到在线查询...")
+            return _query_location_online(ip)
+    else:
+        # 本地数据库无此IP城市信息，直接在线查询
+        log_info(f"[{ip}] 本地数据库无此IP城市信息，切换到在线查询...")
+        return _query_location_online(ip)
+
+
+def _process_city_mapping(location_result, city_mappings):
+    """
+    处理城市名称映射（英文->中文）
+    
+    Args:
+        location_result: 地理位置查询结果
+        city_mappings: 城市映射表
+        
+    Returns:
+        tuple: (city_zh, city_en)
+    """
+    # 获取城市英文名
+    city_en = location_result.get('city_en', location_result.get('city', ''))
+    
+    # 使用映射表获取中文城市名
+    if city_en:
+        city_zh = city_mappings.get(city_en, city_en)
+    else:
+        city_zh = location_result.get('city', '未知')
+    
+    # 如果仍然没有城市名，标记为未知
+    if not city_zh or city_zh == '':
+        city_zh = '未知'
+        city_en = 'Unknown'
+    
+    return city_zh, city_en
+
+
+def _build_final_result(ip, name, server, port, location_result, city_zh, city_en, node_info):
+    """
+    构建最终的结果字典
+    
+    Args:
+        ip: IP地址
+        name: 节点名称
+        server: 原始服务器地址
+        port: 端口
+        location_result: 地理位置查询结果
+        city_zh: 中文城市名
+        city_en: 英文城市名
+        node_info: 原始节点信息
+        
+    Returns:
+        dict: 完整的结果字典
+    """
+    # 获取数据来源信息
+    source = location_result.get('source', 'unknown')
+    service_detail = location_result.get('source', '')
+    
+    # 确定查询来源类型
+    if location_result.get('local_query'):
+        source_type = "local_with_city" if location_result.get('has_city') else "local_no_city"
+    else:
+        source_type = "online_fallback"
+    
+    # 构建结果
+    result = {
+        'node_name': name,
+        'original_server': server,
+        'ip': ip,
+        'port': port,
+        'country': location_result.get('country', '未知'),
+        'country_code': location_result.get('country_code', ''),
+        'city': city_zh,
+        'city_en': city_en if city_en != 'Unknown' else '',
+        'region': location_result.get('region', ''),
+        'isp': location_result.get('isp', ''),
+        'lat': location_result.get('lat', 0.0),
+        'lon': location_result.get('lon', 0.0),
+        'source': source_type,
+        'service_detail': service_detail,
+        'local_query': location_result.get('local_query', False),
+        'has_city': location_result.get('has_city', False) and city_zh != '未知',
+        'accuracy': location_result.get('accuracy', 'unknown'),
+        'timezone': location_result.get('timezone', ''),
+        'postal_code': location_result.get('postal_code', ''),
+        'test_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'node_info': node_info,
+        'is_private_ip': False
+    }
+    
+    return result
+
+
+def _log_final_result(ip, city_zh, location_result):
+    """
+    记录最终查询结果
+    
+    Args:
+        ip: IP地址
+        city_zh: 中文城市名
+        location_result: 地理位置查询结果
+    """
+    source_type = "local_with_city" if location_result.get('local_query') else "online_fallback"
+    service_detail = location_result.get('source', '')
+    country = location_result.get('country', '未知')
+    country_code = location_result.get('country_code', '')
+    
+    if city_zh != '未知':
+        if source_type == "online_fallback":
+            log_info(f"[{ip}] 位置查询完成[{service_detail}]: {city_zh}, {country_code}")
+            None
+        else:
+            # log_info(f"[{ip}] 位置查询完成: {city_zh}, {country_code}")
+            None
+    else:
+        if source_type == "online_fallback":
+            log_warning(f"[{ip}] 位置查询完成但城市信息未知[{service_detail}]: {country}")
+        else:
+            log_warning(f"[{ip}] 位置查询完成但城市信息未知: {country}")
+
+
 def test_node_with_fallback(node_info, city_mappings):
     """
     测试节点获取位置信息 - 智能降级策略
     
     优先使用本地数据库，如果没有城市信息则切换到在线测试
+    
+    Args:
+        node_info: 节点信息字典
+        city_mappings: 城市名称映射表
+        
+    Returns:
+        dict: 位置测试结果，包含地理位置信息和测试状态
     """
     try:
+        # 1. 提取节点基本信息
         server = node_info.get('server', '')
         port = node_info.get('port', 443)
         name = node_info.get('name', server)
@@ -127,154 +350,42 @@ def test_node_with_fallback(node_info, city_mappings):
         
         log_info(f"开始测试节点: {name} ({server}:{port})")
         
-        # 步骤1: 检查服务器地址是否为域名或IP
-        try:
-            # 尝试将地址解析为IP对象
-            ip_obj = ipaddress.ip_address(server)
-            # 如果是IP地址，直接检查是否为私有/特殊IP
-            if is_private_or_special_ip(server):
-                log_warning(f"检测到私有/特殊服务器地址: {server}，标记为未知")
-                return create_unknown_location_result(server, name, server, port, node_info)
-            ip = server
-        except ValueError:
-            # 不是有效的IP地址，假设是域名，需要解析
-            log_debug(f"解析域名: {server}")
-            ip = get_ip_address(server)
-            
-            if not ip:
-                # 无法解析或为私有IP
-                log_warning(f"无法获取有效公网IP地址: {server}，标记为未知")
-                return create_unknown_location_result(None, name, server, port, node_info)
-            
-            # 解析后再次检查是否为私有/特殊IP
-            if is_private_or_special_ip(ip):
-                log_warning(f"域名解析为私有/特殊IP地址: {server} -> {ip}，标记为未知")
-                return create_unknown_location_result(ip, name, server, port, node_info)
+        # 2. 获取节点IP地址
+        ip, ip_validation_result = _get_node_ip_address(server)
+        if ip_validation_result == "private_ip":
+            log_warning(f"节点为私有/特殊IP: {server}")
+            return create_unknown_location_result(ip, name, server, port, node_info)
+        elif ip_validation_result == "resolve_failed":
+            log_warning(f"无法解析节点地址: {server}")
+            return create_unknown_location_result(None, name, server, port, node_info)
         
-        log_debug(f"节点IP地址: {ip}")
+        log_info(f"节点IP地址: {ip}")
         
-        # 步骤2: 先尝试本地数据库查询
-        from Config.IP_Test import check_ip_has_city_local, get_ip_location
-        
-        local_has_city = check_ip_has_city_local(ip)
-        log_debug(f"本地数据库城市信息可用性: {local_has_city}")
-        
-        location = None
-        source = "unknown"
-        service_detail = ""  # 记录具体的服务名称
-        
-        if local_has_city:
-            # 使用本地数据库（不启用降级）
-            location = get_ip_location(ip, enable_fallback=False)
-            if location:
-                if location.get('has_city'):
-                    source = "local_with_city"
-                    service_detail = "GeoLite2-City.mmdb"
-                    log_info(f"[{ip}] 本地查询成功（有城市信息）[{service_detail}]: {location.get('city', 'Unknown')}, {location.get('country_code', 'Unknown')}")
-                else:
-                    source = "local_no_city"
-                    service_detail = "GeoLite2-City.mmdb"
-                    # 输出本地查询到的结果，即使没有城市信息
-                    country_code = location.get('country_code', 'Unknown')
-                    log_info(f"[{ip}] 本地查询（无城市信息）: {country_code}")
-                    # 也可以输出其他已查询到的信息
-                    if location.get('country'):
-                        log_debug(f"[{ip}] 国家: {location.get('country')}")
-                    if location.get('region'):
-                        log_debug(f"[{ip}] 地区: {location.get('region')}")
-            else:
-                source = "local_no_data"
-                log_warning(f"[{ip}] 本地查询失败: 无法获取任何位置信息")
-        else:
-            source = "local_no_city_available"
-            log_debug(f"[{ip}] 本地数据库无此IP城市信息")
-        
-        # 步骤3: 如果本地没有城市信息，切换到在线测试
-        if not location or not location.get('has_city'):
-            log_info(f"[{ip}] 本地查询无城市信息，切换到在线查询...")
-            online_location = get_ip_location_force_online(ip)
-            
-            if online_location:
-                location = online_location
-                source = "online_fallback"
-                service_detail = location.get('source', 'unknown_api')
-                
-                if online_location.get('has_city'):
-                    city_name = online_location.get('city', 'Unknown')
-                    country_code = online_location.get('country_code', 'Unknown')
-                    log_info(f"[{ip}] 在线查询成功[{service_detail}]: {city_name}, {country_code}")
-                else:
-                    country_code = online_location.get('country_code', 'Unknown')
-                    log_warning(f"[{ip}] 在线查询完成但无城市信息[{service_detail}]: {country_code}")
-            else:
-                log_error(f"[{ip}] 在线查询失败: 所有在线服务均无法获取位置信息")
-        
-        # 步骤4: 处理查询结果
-        if location:
-            # 获取城市英文名和中文名映射
-            city_en = location.get('city_en', location.get('city', ''))
-            if city_en:
-                # 使用映射表获取中文城市名
-                city_zh = city_mappings.get(city_en, city_en)
-            else:
-                city_zh = location.get('city', '未知')
-            
-            # 如果仍然没有城市名，标记为未知
-            if not city_zh or city_zh == '':
-                city_zh = '未知'
-                city_en = 'Unknown'
-            
-            # 获取国家信息
-            country = location.get('country', '未知')
-            country_code = location.get('country_code', '')
-            
-            # 获取服务详情
-            if not service_detail and location.get('source'):
-                service_detail = location.get('source')
-            
-            # 构建完整结果
-            result = {
-                'node_name': name,
-                'original_server': server,
-                'ip': ip,
-                'port': port,
-                'country': country,
-                'country_code': country_code,
-                'city': city_zh,
-                'city_en': city_en if city_en != 'Unknown' else '',
-                'region': location.get('region', ''),
-                'isp': location.get('isp', ''),
-                'lat': location.get('lat', 0.0),
-                'lon': location.get('lon', 0.0),
-                'source': source,
-                'service_detail': service_detail,  # 添加服务详情字段
-                'local_query': location.get('local_query', False),
-                'has_city': location.get('has_city', False) and city_zh != '未知',
-                'accuracy': location.get('accuracy', 'unknown'),
-                'timezone': location.get('timezone', ''),
-                'postal_code': location.get('postal_code', ''),
-                'test_time': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'node_info': node_info,
-                'is_private_ip': False
-            }
-            
-            # 记录最终结果
-            if city_zh != '未知':
-                if source == "online_fallback":
-                    log_info(f"[{ip}] 位置查询完成[{service_detail}]: {city_zh}, {country_code}")
-                else:
-                    log_info(f"[{ip}] 位置查询完成: {city_zh}, {country_code}")
-            else:
-                if source == "online_fallback":
-                    log_warning(f"[{ip}] 位置查询完成但城市信息未知[{service_detail}]: {country}")
-                else:
-                    log_warning(f"[{ip}] 位置查询完成但城市信息未知: {country}")
-            
-            return result
-        else:
-            # 所有查询都失败
+        # 3. 智能地理位置查询
+        location_result = _query_location_with_fallback(ip)
+        if not location_result:
             log_error(f"[{ip}] 所有地理位置查询都失败")
             return create_unknown_location_result(ip, name, server, port, node_info)
+        
+        # 4. 处理城市名称映射
+        city_zh, city_en = _process_city_mapping(location_result, city_mappings)
+        
+        # 5. 构建最终结果
+        result = _build_final_result(
+            ip=ip,
+            name=name,
+            server=server,
+            port=port,
+            location_result=location_result,
+            city_zh=city_zh,
+            city_en=city_en,
+            node_info=node_info
+        )
+        
+        # 6. 记录最终结果
+        _log_final_result(ip, city_zh, location_result)
+        
+        return result
             
     except Exception as e:
         log_error(f"测试节点失败 {node_info.get('name', 'Unknown')}: {e}")
